@@ -70,10 +70,11 @@ final class PiSessionDiscovery: SessionDiscovery {
         return root
     }
 
-    /// Maximum records inspected during discovery and the byte ceiling that
-    /// backs it. Current builds write one padded title record before the
+    /// Maximum records inspected during discovery and the total byte budget
+    /// across them. Current builds write one padded title record before the
     /// canonical session header; a short bounded preamble is enough and keeps
-    /// discovery from reading whole large files.
+    /// discovery from reading whole large files. The byte budget bounds the
+    /// header hunt itself — record payloads after the header are never read.
     static let maxPreambleRecords = 4
     static let maxPreambleBytes = 32 * 1024
 
@@ -85,19 +86,31 @@ final class PiSessionDiscovery: SessionDiscovery {
         var buffer = Data()
         let newline = Data([0x0A])
         var recordsRead = 0
+        // Total bytes read while hunting the header. The bound applies across
+        // the opening records, not to the size of the complete transcript.
+        var totalRead = 0
 
         while recordsRead < Self.maxPreambleRecords {
-            if let range = buffer.range(of: newline) {
+            // First drain every complete line already in the buffer, so a large
+            // chunk that arrived with a newline in it is processed instead of
+            // being rejected wholesale.
+            while recordsRead < Self.maxPreambleRecords,
+                  let range = buffer.range(of: newline) {
                 let lineData = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
                 buffer = Data(buffer[range.upperBound..<buffer.endIndex])
                 recordsRead += 1
                 if lineData.isEmpty { continue }
                 if Self.isCanonicalSessionHeader(lineData, decoder: decoder) { return true }
                 if !Self.isRecognizedPreambleRecord(lineData, decoder: decoder) { return false }
-                continue
             }
+            if recordsRead >= Self.maxPreambleRecords { return false }
 
-            let chunk = (try? handle.read(upToCount: 64 * 1024)) ?? Data()
+            // Read only what the remaining header budget allows, plus one byte
+            // to detect an oversized record. This bounds total I/O for a file
+            // whose opening records never resolve to a header.
+            let chunkBudget = Self.maxPreambleBytes - totalRead + 1
+            guard chunkBudget > 0 else { return false }
+            let chunk = (try? handle.read(upToCount: chunkBudget)) ?? Data()
             if chunk.isEmpty {
                 recordsRead += 1
                 if !buffer.isEmpty, Self.isCanonicalSessionHeader(buffer, decoder: decoder) {
@@ -105,8 +118,8 @@ final class PiSessionDiscovery: SessionDiscovery {
                 }
                 return false
             }
+            totalRead += chunk.count
             buffer.append(chunk)
-            if buffer.count > Self.maxPreambleBytes { return false }
         }
         return false
     }
