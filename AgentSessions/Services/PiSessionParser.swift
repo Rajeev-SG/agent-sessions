@@ -225,7 +225,7 @@ final class PiSessionParser {
                 return nil
             }
         }
-        guard entries.first?.type == "session" else { return nil }
+        guard hasCanonicalSessionHeader(entries) else { return nil }
         return entries
     }
 
@@ -265,7 +265,7 @@ final class PiSessionParser {
             return nil
         }
 
-        guard entries.first?.type == "session" else { return nil }
+        guard hasCanonicalSessionHeader(entries) else { return nil }
         return entries
     }
 
@@ -274,6 +274,30 @@ final class PiSessionParser {
                                                        lineCount: Int,
                                                        parsedEntries: [Entry]) -> Bool {
         !parsedEntries.isEmpty && !content.hasSuffix("\n") && lineIndex == lineCount - 1
+    }
+
+    /// Recognized preamble record types that may legally precede the canonical
+    /// session header. Current builds open each file with one padded title
+    /// record; anything else before `session` means the file is not a Pi
+    /// session.
+    static let preambleRecordTypes: Set<String> = ["title"]
+    static let maxPreambleRecords = 4
+
+    private static func isCanonicalSessionHeader(_ entry: Entry) -> Bool {
+        guard entry.type == "session" else { return false }
+        guard let id = entry.id?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else { return false }
+        return true
+    }
+
+    private static func hasCanonicalSessionHeader(_ entries: [Entry]) -> Bool {
+        var preambleCount = 0
+        for entry in entries {
+            if isCanonicalSessionHeader(entry) { return true }
+            guard preambleRecordTypes.contains(entry.type) else { return false }
+            preambleCount += 1
+            if preambleCount >= maxPreambleRecords { return false }
+        }
+        return false
     }
 
     private static func buildEvents(entries: [Entry]) -> [SessionEvent] {

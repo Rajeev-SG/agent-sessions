@@ -98,6 +98,149 @@ final class PiSessionParserTests: XCTestCase {
         XCTAssertEqual(discovery.discoverSessionFiles().map(\.lastPathComponent), ["valid.jsonl"])
     }
 
+    func testDiscoveryAcceptsTitleBeforeSessionShape() throws {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pi-discovery-title-first-\(UUID().uuidString)", isDirectory: true)
+        let sessionsDir = temp.appendingPathComponent("agent/sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let url = sessionsDir.appendingPathComponent("title-first.jsonl")
+        let lines = [
+            #"{"type":"title","v":1,"title":"Chapter 12 notes","updatedAt":"2026-09-09T17:27:18.449Z","pad":"                                                                                                            "}"#,
+            #"{"type":"session","version":3,"id":"01a08735-b2b1-7000-bad9-87ceabb4aa1a","timestamp":"2026-09-09T17:27:18.449Z","cwd":"/tmp/as-agent-fixture/project"}"#
+        ]
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+
+        let discovery = PiSessionDiscovery(customRoot: temp.path)
+        XCTAssertEqual(discovery.discoverSessionFiles().map(\.lastPathComponent), ["title-first.jsonl"])
+    }
+
+    func testDiscoveryKeepsSessionFirstCompatibility() throws {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pi-discovery-session-first-\(UUID().uuidString)", isDirectory: true)
+        let sessionsDir = temp.appendingPathComponent("agent/sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let url = sessionsDir.appendingPathComponent("session-first.jsonl")
+        try #"{"type":"session","version":3,"id":"pi-legacy","timestamp":"2026-05-12T01:02:27.657Z"}"#
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        let discovery = PiSessionDiscovery(customRoot: temp.path)
+        XCTAssertEqual(discovery.discoverSessionFiles().map(\.lastPathComponent), ["session-first.jsonl"])
+    }
+
+    func testDiscoveryRejectsUnrelatedAndMalformedPrefixes() throws {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pi-discovery-reject-\(UUID().uuidString)", isDirectory: true)
+        let sessionsDir = temp.appendingPathComponent("agent/sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let malformed = sessionsDir.appendingPathComponent("malformed.jsonl")
+        try #"{"type":"title","broken"#
+            .write(to: sessionsDir.appendingPathComponent("malformed.jsonl"), atomically: true, encoding: .utf8)
+
+        let unrelated = sessionsDir.appendingPathComponent("unrelated.jsonl")
+        let unrelatedLines = [
+            #"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"no header here"}]}}"#,
+            #"{"type":"session","version":3,"id":"late-header"}"#
+        ]
+        try unrelatedLines.joined(separator: "\n")
+            .write(to: unrelated, atomically: true, encoding: .utf8)
+
+        let headerMissingID = sessionsDir.appendingPathComponent("no-id.jsonl")
+        try #"{"type":"session","version":3,"id":""}"#
+            .write(to: headerMissingID, atomically: true, encoding: .utf8)
+
+        let discovery = PiSessionDiscovery(customRoot: temp.path)
+        XCTAssertEqual(discovery.discoverSessionFiles(), [])
+    }
+
+    func testDiscoveryStopsReadingAfterBoundedPrefix() throws {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pi-discovery-bounded-\(UUID().uuidString)", isDirectory: true)
+        let sessionsDir = temp.appendingPathComponent("agent/sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        // A large unrelated prefix after the preamble records must be rejected
+        // without parsing the whole file. The pad is deliberately oversized so
+        // an unbounded scan would read megabytes.
+        let url = sessionsDir.appendingPathComponent("oversized-prefix.jsonl")
+        let pad = String(repeating: "x", count: 256 * 1024)
+        let lines = [
+            #"{"type":"title","v":1,"title":"","updatedAt":"2026-09-09T17:27:18.449Z","pad":"\(pad)"}"#,
+            #"{"type":"session","version":3,"id":"too-late","timestamp":"2026-09-09T17:27:18.449Z"}"#
+        ]
+        try lines.joined(separator: "\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        let discovery = PiSessionDiscovery(customRoot: temp.path)
+        XCTAssertFalse(discovery.discoverSessionFiles().contains(url))
+    }
+
+    func testParseFileAcceptsTitleBeforeSessionHeader() throws {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pi-parse-title-first-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let url = temp.appendingPathComponent("title-first.jsonl")
+        let lines = [
+            #"{"type":"title","v":1,"title":"Chapter 12","updatedAt":"2026-09-09T17:27:18.449Z","pad":"                                                                                                            "}"#,
+            #"{"type":"session","version":3,"id":"01a08735-b2b1-7000-bad9-87ceabb4aa1a","timestamp":"2026-09-09T17:27:18.449Z","cwd":"/tmp/as-agent-fixture/project"}"#,
+            #"{"type":"message","id":"m1","parentId":"01a08735-b2b1-7000-bad9-87ceabb4aa1a","timestamp":"2026-09-09T17:27:19.000Z","message":{"role":"user","content":[{"type":"text","text":"Summarize chapter 12."}]}}"#
+        ]
+        try lines.joined(separator: "\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        let preview = try XCTUnwrap(PiSessionParser.parseFile(at: url))
+        XCTAssertEqual(preview.id, "01a08735-b2b1-7000-bad9-87ceabb4aa1a")
+
+        let session = try XCTUnwrap(PiSessionParser.parseFileFull(at: url))
+        XCTAssertEqual(session.id, "01a08735-b2b1-7000-bad9-87ceabb4aa1a")
+        XCTAssertTrue(session.events.contains { $0.kind == .user })
+    }
+
+    func testParseFileRejectsMalformedPreamble() throws {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pi-parse-bad-preamble-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let url = temp.appendingPathComponent("bad-preamble.jsonl")
+        let lines = [
+            #"{"type":"message","id":"m0","message":{"role":"user","content":[{"type":"text","text":"preamble not allowed"}]}}"#,
+            #"{"type":"session","version":3,"id":"after-message","timestamp":"2026-09-09T17:27:18.449Z"}"#
+        ]
+        try lines.joined(separator: "\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertNil(PiSessionParser.parseFile(at: url))
+        XCTAssertNil(PiSessionParser.parseFileFull(at: url))
+    }
+
+    func testParseFileRejectsSessionAfterTooManyTitleRecords() throws {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pi-parse-too-many-titles-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let url = temp.appendingPathComponent("too-many-titles.jsonl")
+        let titleLine = #"{"type":"title","v":1,"title":"","updatedAt":"2026-09-09T17:27:18.449Z"}"#
+        let lines = [
+            titleLine, titleLine, titleLine, titleLine,
+            #"{"type":"session","version":3,"id":"fifth-record","timestamp":"2026-09-09T17:27:18.449Z"}"#
+        ]
+        try lines.joined(separator: "\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertNil(PiSessionParser.parseFile(at: url))
+        XCTAssertNil(PiSessionParser.parseFileFull(at: url))
+    }
+
     func testParseFileFullUsesCurrentTreePathOnly() throws {
         let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("pi-tree-\(UUID().uuidString)", isDirectory: true)

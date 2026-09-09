@@ -70,22 +70,61 @@ final class PiSessionDiscovery: SessionDiscovery {
         return root
     }
 
+    /// Maximum records inspected during discovery and the byte ceiling that
+    /// backs it. Current builds write one padded title record before the
+    /// canonical session header; a short bounded preamble is enough and keeps
+    /// discovery from reading whole large files.
+    static let maxPreambleRecords = 4
+    static let maxPreambleBytes = 32 * 1024
+
     private func isPiSessionFile(_ url: URL) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
 
-        let data = handle.readData(ofLength: 64 * 1024)
-        guard let prefix = String(data: data, encoding: .utf8),
-              let line = prefix.split(separator: "\n", omittingEmptySubsequences: true).first,
-              let lineData = String(line).data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
-            return false
-        }
+        let decoder = JSONDecoder()
+        var buffer = Data()
+        let newline = Data([0x0A])
+        var recordsRead = 0
 
-        guard object["type"] as? String == "session" else { return false }
-        if let id = object["id"] as? String, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return true
+        while recordsRead < Self.maxPreambleRecords {
+            if let range = buffer.range(of: newline) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
+                buffer = Data(buffer[range.upperBound..<buffer.endIndex])
+                recordsRead += 1
+                if lineData.isEmpty { continue }
+                if Self.isCanonicalSessionHeader(lineData, decoder: decoder) { return true }
+                if !Self.isRecognizedPreambleRecord(lineData, decoder: decoder) { return false }
+                continue
+            }
+
+            let chunk = (try? handle.read(upToCount: 64 * 1024)) ?? Data()
+            if chunk.isEmpty {
+                recordsRead += 1
+                if !buffer.isEmpty, Self.isCanonicalSessionHeader(buffer, decoder: decoder) {
+                    return true
+                }
+                return false
+            }
+            buffer.append(chunk)
+            if buffer.count > Self.maxPreambleBytes { return false }
         }
         return false
+    }
+
+    private static func isCanonicalSessionHeader(_ lineData: Data, decoder: JSONDecoder) -> Bool {
+        guard let entry = try? decoder.decode(HeaderProbe.self, from: lineData) else { return false }
+        guard entry.type == "session" else { return false }
+        guard let id = entry.id?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else { return false }
+        return true
+    }
+
+    private static func isRecognizedPreambleRecord(_ lineData: Data, decoder: JSONDecoder) -> Bool {
+        guard let probe = try? decoder.decode(HeaderProbe.self, from: lineData) else { return false }
+        return probe.type == "title"
+    }
+
+    private struct HeaderProbe: Decodable {
+        let type: String
+        let id: String?
     }
 }
