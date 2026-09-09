@@ -158,6 +158,56 @@ final class PiSessionParserTests: XCTestCase {
         XCTAssertEqual(discovery.discoverSessionFiles(), [])
     }
 
+    func testDiscoveryAcceptsRealSizedFileWithTitlePreamble() throws {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pi-discovery-real-sized-\(UUID().uuidString)", isDirectory: true)
+        let sessionsDir = temp.appendingPathComponent("agent/sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        // Representative real shape: a 256-byte padded title record, a valid
+        // session header, then enough tail content to push the file well past
+        // both the 64 KiB chunk size and the 32 KiB preamble budget. A chunked
+        // reader that bounds the buffer (rather than the header hunt) would
+        // reject this file; the fix must accept it.
+        let url = sessionsDir.appendingPathComponent("real-sized.jsonl")
+        let padding = String(repeating: " ", count: 206)
+        let titleLine = "{\"type\":\"title\",\"v\":1,\"title\":\"Sprint review\",\"updatedAt\":\"2026-09-09T17:27:18.449Z\",\"pad\":\"\(padding)\"}"
+        let sessionLine = "{\"type\":\"session\",\"version\":3,\"id\":\"01a08735-b2b1-7000-bad9-87ceabb4aa1a\",\"timestamp\":\"2026-09-09T17:27:18.449Z\",\"cwd\":\"/tmp/as-agent-fixture/project\"}"
+        var tail = ""
+        while titleLine.utf8.count + sessionLine.utf8.count + tail.utf8.count < 200 * 1024 {
+            tail += "{\"type\":\"message\",\"id\":\"filler\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"padding to exceed one chunk\"}]}}\n"
+        }
+        try [titleLine, sessionLine, tail].joined(separator: "\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        let discovery = PiSessionDiscovery(customRoot: temp.path)
+        XCTAssertTrue(discovery.discoverSessionFiles().map(\.lastPathComponent).contains("real-sized.jsonl"))
+        let parsed = try XCTUnwrap(PiSessionParser.parseFile(at: url))
+        XCTAssertEqual(parsed.id, "01a08735-b2b1-7000-bad9-87ceabb4aa1a")
+    }
+
+    func testDiscoveryStillRejectsHeaderlessLargeFile() throws {
+        // A file whose opening records are valid JSON but never a session
+        // header must still be rejected without reading the whole file.
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pi-discovery-headerless-\(UUID().uuidString)", isDirectory: true)
+        let sessionsDir = temp.appendingPathComponent("agent/sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let url = sessionsDir.appendingPathComponent("headerless.jsonl")
+        var lines: [String] = []
+        for i in 0..<2000 {
+            lines.append("{\"type\":\"message\",\"id\":\"filler-\(i)\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"no header here\"}]}}")
+        }
+        try lines.joined(separator: "\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        let discovery = PiSessionDiscovery(customRoot: temp.path)
+        XCTAssertFalse(discovery.discoverSessionFiles().map(\.lastPathComponent).contains("headerless.jsonl"))
+    }
+
     func testDiscoveryStopsReadingAfterBoundedPrefix() throws {
         let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("pi-discovery-bounded-\(UUID().uuidString)", isDirectory: true)
